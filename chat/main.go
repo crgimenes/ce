@@ -19,8 +19,106 @@ import (
 )
 
 var (
-	topicNameFlag = flag.String("topicName", "applesauce", "name of topic to join")
+	topicNameFlag = flag.String("topicName", "applesauce_crg", "name of topic to join")
+	connected     = make(map[peer.ID]bool)
+	ignore        = make(map[peer.ID]bool)
 )
+
+func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
+	// Start a DHT, for use in peer discovery. We can't just make a new DHT
+	// client because we want each peer to maintain its own local copy of the
+	// DHT, so that the bootstrapping node of the DHT can go down without
+	// inhibiting future peer discovery.
+	kademliaDHT, err := dht.New(ctx, h, dht.MaxRecordAge(10*time.Second))
+	if err != nil {
+		panic(err)
+	}
+	if err = kademliaDHT.Bootstrap(ctx); err != nil {
+		panic(err)
+	}
+	var wg sync.WaitGroup
+	for _, peerAddr := range dht.DefaultBootstrapPeers {
+		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := h.Connect(ctx, *peerinfo); err != nil {
+				fmt.Println("Bootstrap warning:", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	return kademliaDHT
+}
+
+func discoverPeers(ctx context.Context, h host.Host) {
+	kademliaDHT := initDHT(ctx, h)
+	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
+	for {
+		dutil.Advertise(ctx, routingDiscovery, *topicNameFlag)
+
+		peerChan, err := routingDiscovery.FindPeers(ctx, *topicNameFlag)
+		if err != nil {
+			panic(err)
+		}
+		for peer := range peerChan {
+			if peer.ID == h.ID() {
+				continue // No self connection
+			}
+
+			if _, ok := ignore[peer.ID]; ok {
+				continue // Ignore this peer
+			}
+
+			if _, ok := connected[peer.ID]; ok {
+				continue // Already connected
+			}
+
+			err := h.Connect(ctx, peer)
+			if err != nil {
+				if err.Error() == "no addresses" { // TODO: Handle this by compare ErrNoAddresses
+					ignore[peer.ID] = true
+					continue
+				}
+
+				fmt.Println("Failed connecting to", peer.ID.Pretty(), ", error:", err)
+
+				// ignore peers that we can't connect to
+				ignore[peer.ID] = true
+				continue
+			}
+			fmt.Println("Connected to:", peer.ID.Pretty())
+
+			// add peer to connected list
+			connected[peer.ID] = true
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func streamConsoleTo(ctx context.Context, topic *pubsub.Topic) {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		s, err := reader.ReadString('\n')
+		if err != nil {
+			panic(err)
+		}
+		if err := topic.Publish(ctx, []byte(s)); err != nil {
+			fmt.Println("### Publish error:", err)
+		}
+	}
+}
+
+func printMessagesFrom(ctx context.Context, sub *pubsub.Subscription) {
+	for {
+		m, err := sub.Next(ctx)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(m.ReceivedFrom, ": ", string(m.Message.Data))
+	}
+}
 
 func main() {
 	flag.Parse()
@@ -47,84 +145,4 @@ func main() {
 		panic(err)
 	}
 	printMessagesFrom(ctx, sub)
-}
-
-func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
-	// Start a DHT, for use in peer discovery. We can't just make a new DHT
-	// client because we want each peer to maintain its own local copy of the
-	// DHT, so that the bootstrapping node of the DHT can go down without
-	// inhibiting future peer discovery.
-	kademliaDHT, err := dht.New(ctx, h, dht.MaxRecordAge(5*time.Minute))
-	if err != nil {
-		panic(err)
-	}
-	if err = kademliaDHT.Bootstrap(ctx); err != nil {
-		panic(err)
-	}
-	var wg sync.WaitGroup
-	for _, peerAddr := range dht.DefaultBootstrapPeers {
-		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := h.Connect(ctx, *peerinfo); err != nil {
-				fmt.Println("Bootstrap warning:", err)
-			}
-		}()
-	}
-	wg.Wait()
-
-	return kademliaDHT
-}
-
-func discoverPeers(ctx context.Context, h host.Host) {
-	kademliaDHT := initDHT(ctx, h)
-	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
-	dutil.Advertise(ctx, routingDiscovery, *topicNameFlag)
-
-	// Look for others who have announced and attempt to connect to them
-	anyConnected := false
-	for !anyConnected {
-		fmt.Println("Searching for peers...")
-		peerChan, err := routingDiscovery.FindPeers(ctx, *topicNameFlag)
-		if err != nil {
-			panic(err)
-		}
-		for peer := range peerChan {
-			if peer.ID == h.ID() {
-				continue // No self connection
-			}
-			err := h.Connect(ctx, peer)
-			if err != nil {
-				fmt.Println("Failed connecting to ", peer.ID.Pretty(), ", error:", err)
-			} else {
-				fmt.Println("Connected to:", peer.ID.Pretty())
-				anyConnected = true
-			}
-		}
-	}
-	fmt.Println("Peer discovery complete")
-}
-
-func streamConsoleTo(ctx context.Context, topic *pubsub.Topic) {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		s, err := reader.ReadString('\n')
-		if err != nil {
-			panic(err)
-		}
-		if err := topic.Publish(ctx, []byte(s)); err != nil {
-			fmt.Println("### Publish error:", err)
-		}
-	}
-}
-
-func printMessagesFrom(ctx context.Context, sub *pubsub.Subscription) {
-	for {
-		m, err := sub.Next(ctx)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(m.ReceivedFrom, ": ", string(m.Message.Data))
-	}
 }
